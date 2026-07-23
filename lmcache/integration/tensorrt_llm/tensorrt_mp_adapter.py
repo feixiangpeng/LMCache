@@ -302,13 +302,15 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
         TRT-LLM will defer block deallocation until ``get_finished`` on
         the worker reports the request complete.
 
-        Note: ``_saving_in_flight`` is populated at ``build_connector_meta``
-        time and is never cleaned up — ``request_finished`` is called
-        exactly once per request by the TRT-LLM runtime, so cleanup is
-        unnecessary. The set grows only by the number of concurrent
-        requests with saves scheduled.
+        The ID is removed from ``_saving_in_flight`` on consumption since
+        ``request_finished`` is called exactly once per request by the
+        TRT-LLM runtime — keeping it would leak memory over long runs.
         """
-        return request.request_id in self._saving_in_flight
+        try:
+            self._saving_in_flight.remove(request.request_id)
+            return True
+        except KeyError:
+            return False
 
     def update_state_after_alloc(
         self, request: LlmRequest, block_ids: List[int]

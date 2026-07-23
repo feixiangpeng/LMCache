@@ -355,7 +355,7 @@ class TestMPAdapterAsyncStore:
         assert 99 in worker._inflight_saves  # still tracked
 
     def test_request_finished_returns_true_while_in_flight(self, monkeypatch):
-        """request_finished returns True while save is in flight."""
+        """request_finished returns True when save is in flight, False otherwise."""
         sched, mp_mod = self._make_scheduler(monkeypatch)
 
         # Simulate: build_connector_meta registered a save for req 42.
@@ -363,8 +363,10 @@ class TestMPAdapterAsyncStore:
 
         req = _FakeLlmRequest(request_id=42)
         assert sched.request_finished(req, []) is True
+        # Second call returns False (consumed on first call).
+        assert sched.request_finished(req, []) is False
 
-        # Without the save registered:
+        # Unknown request returns False.
         req2 = _FakeLlmRequest(request_id=99)
         assert sched.request_finished(req2, []) is False
 
@@ -562,14 +564,16 @@ class TestInProcessAdapterAsyncStore:
         assert 7 not in worker._inflight_loads
 
     def test_request_finished_scheduler(self, monkeypatch):
-        """request_finished returns True while save in flight."""
+        """request_finished returns True when save in flight, False otherwise."""
         sched, inproc_mod = self._make_scheduler(monkeypatch)
         sched._saving_in_flight.add(99)
 
         req = _FakeLlmRequest(request_id=99)
         assert sched.request_finished(req, []) is True
+        # Consumed — second call returns False.
+        assert sched.request_finished(req, []) is False
 
-        # Without the save registered:
+        # Unknown request returns False.
         req2 = _FakeLlmRequest(request_id=100)
         assert sched.request_finished(req2, []) is False
 

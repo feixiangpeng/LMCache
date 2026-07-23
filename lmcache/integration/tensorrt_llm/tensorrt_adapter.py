@@ -280,11 +280,14 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
         request, deferring GPU block deallocation until ``get_finished``
         on the worker reports it complete.
 
-        Note: ``_saving_in_flight`` is populated at ``build_connector_meta``
-        time and never cleaned up — ``request_finished`` is called exactly
-        once per request, so cleanup is unnecessary.
+        The ID is removed on consumption since ``request_finished`` is
+        called exactly once per request — keeping it would leak memory.
         """
-        return request.request_id in self._saving_in_flight
+        try:
+            self._saving_in_flight.remove(request.request_id)
+            return True
+        except KeyError:
+            return False
 
     def update_state_after_alloc(
         self, request: LlmRequest, block_ids: List[int]
