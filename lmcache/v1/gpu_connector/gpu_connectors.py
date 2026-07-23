@@ -1933,7 +1933,9 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
         return torch.Size([num_tokens, 2, self.hidden_dim_size])
 
 
-_TRTLLM_KERNEL_BATCH_SIZE = 32
+# Upper bound imposed by the MemoryObj4 struct in csrc/mp_mem_kernels.cuh:
+# multi_layer_block_kv_transfer accepts at most 4 object pointers per launch.
+_TRTLLM_KERNEL_BATCH_SIZE = 4
 
 
 class TRTLLMGPUConnector(GPUConnectorInterface):

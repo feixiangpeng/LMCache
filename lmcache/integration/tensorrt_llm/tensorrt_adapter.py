@@ -160,6 +160,9 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
         self._engine: Optional[LMCacheEngine] = None
         # Track request IDs with in-flight saves for request_finished.
         self._saving_in_flight: Set[int] = set()
+        # Async-loading requests whose block_ids arrived via
+        # update_state_after_alloc. Consumed by build_connector_meta.
+        self._pending_async_loads: Dict[int, List[int]] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -270,6 +273,14 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
                 )
                 self._saving_in_flight.add(req.request_id)
 
+        # Inject async-loading requests that were excluded from
+        # scheduler_output but received block_ids via update_state_after_alloc.
+        for req_id, block_ids in self._pending_async_loads.items():
+            if req_id in self._pending:
+                all_tokens, _num_matched = self._pending[req_id]
+                meta.loads[req_id] = _BlockSpec(tokens=all_tokens, block_ids=block_ids)
+
+        self._pending_async_loads.clear()
         self._pending.clear()
         return meta
 
@@ -292,10 +303,19 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
     def update_state_after_alloc(
         self, request: LlmRequest, block_ids: List[int]
     ) -> None:
-        """No-op — block IDs are captured in ``build_connector_meta``
-        from ``scheduler_output.new_requests``.
+        """Store block_ids for async-loading requests.
+
+        TRT-LLM calls this after allocating KV blocks for every context
+        request. Requests that returned ``is_async=True`` from
+        ``get_num_new_matched_tokens`` are excluded from the scheduler
+        output (and therefore from ``build_connector_meta``'s normal
+        path). We store their block_ids here so
+        ``build_connector_meta`` can inject them into metadata.loads.
         """
-        pass
+        if request.request_id in self._pending:
+            _tokens, num_matched = self._pending[request.request_id]
+            if num_matched > 0:
+                self._pending_async_loads[request.request_id] = list(block_ids)
 
 
 class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
