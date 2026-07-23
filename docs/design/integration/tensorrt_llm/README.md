@@ -117,14 +117,17 @@ TRT-LLM's async connector ABC (`get_finished` / `request_finished` /
 
 ### Scheduler ↔ Worker coordination
 
-TRT-LLM constructs the scheduler and worker independently; they don't
-share a constructor argument. The adapters use a `set_scheduler` method
-on the worker (called by whoever wires the connector) to establish the
-cross-reference needed for `request_finished` → save-in-flight
-tracking. The pre-registration of save IDs happens at
-`build_connector_meta` time (before the STORE fires in `wait_for_save`)
-so that `request_finished` can return `True` from the moment TRT-LLM
-first asks.
+TRT-LLM constructs the scheduler and worker independently (no shared
+constructor argument, no wiring hook). The adapters therefore avoid
+cross-references entirely:
+
+- **Scheduler** tracks `_saving_in_flight` on its own: populated at
+  `build_connector_meta` time, checked once by `request_finished`.
+  Never cleaned up (the runtime only calls `request_finished` once per
+  request; the set grows only by concurrent-saves count).
+- **Worker** fires `END_SESSION` directly in `get_finished` when a save
+  completes — it has its own `_mq_client` to the same daemon, no
+  scheduler reference needed.
 
 ## Forcing real LMCache hits in tests
 
