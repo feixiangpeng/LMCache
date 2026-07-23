@@ -70,6 +70,62 @@ at init — separate from `to_gpu`/`from_gpu`. The factory in
 `LMCacheMetadata` plus the device, and the adapter wires the pool
 tensor in afterwards.
 
+## Async protocol
+
+Both adapters implement fully non-blocking store and load paths using
+TRT-LLM's async connector ABC (`get_finished` / `request_finished` /
+`is_async` return from `get_num_new_matched_tokens`).
+
+### Store (GPU → cache)
+
+| Step | In-process | Multi-process |
+|---|---|---|
+| Submit | `engine.store()` enqueued on `store_stream` | `STORE` submitted via ZMQ (fire-and-forget) |
+| Track | CUDA event recorded on `store_stream` | `MessagingFuture` + IPC event keepalive |
+| Poll | `event.query()` in `get_finished` | `future.query()` in `get_finished` |
+| Report | Return req ID in `finished_saving` list | Same |
+| Dealloc | `request_finished` → `True` until reported | Same |
+| Session cleanup | N/A (in-process) | `END_SESSION` fired only after save completes |
+
+### Load (cache → GPU)
+
+| Step | In-process | Multi-process |
+|---|---|---|
+| Submit | `engine.retrieve()` on `load_stream` | `RETRIEVE` via ZMQ (non-blocking) |
+| Park | `get_num_new_matched_tokens` returns `is_async=True` | Same |
+| Track | CUDA event on `load_stream` | `MessagingFuture` + IPC event |
+| Report | Return req ID in `finished_loading` list | Same |
+| Resume | TRT-LLM reschedules request after all workers report | Same |
+
+### Correctness invariants
+
+1. **Block lifetime**: GPU blocks stay pinned while a save is in flight.
+   `request_finished` returns `True`, and TRT-LLM defers `free_resources`
+   until `get_finished` reports the ID. Breaking this → silent KV
+   corruption from block reuse during active D2H copy.
+
+2. **Eligibility contract**: `get_finished` only returns IDs that have
+   been passed in as `finished_gen_req_ids` / `started_loading_req_ids`.
+   The runtime allgathers across all workers — an ID is actionable only
+   once ALL workers have reported it.
+
+3. **END_SESSION ordering** (MP only): the daemon's `end_session`
+   handler cleans up per-request state (lookup locks, session hashes).
+   The scheduler defers `END_SESSION` until `mark_save_finished` is
+   called, ensuring the daemon's STORE handler has finished using the
+   session state.
+
+### Scheduler ↔ Worker coordination
+
+TRT-LLM constructs the scheduler and worker independently; they don't
+share a constructor argument. The adapters use a `set_scheduler` method
+on the worker (called by whoever wires the connector) to establish the
+cross-reference needed for `request_finished` → save-in-flight
+tracking. The pre-registration of save IDs happens at
+`build_connector_meta` time (before the STORE fires in `wait_for_save`)
+so that `request_finished` can return `True` from the moment TRT-LLM
+first asks.
+
 ## Forcing real LMCache hits in tests
 
 TRT-LLM has its own GPU block reuse. To verify LMCache contributes the

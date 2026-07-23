@@ -5,18 +5,29 @@ Implements ``LMCacheKvConnectorScheduler`` and ``LMCacheKvConnectorWorker`` —
 the two classes TRT-LLM's ``kv_connector_config`` requires — backed by
 an in-process LMCache engine singleton.
 
+Async protocol:
+    - ``wait_for_save``: enqueues ``engine.store`` on the store stream
+      and records a CUDA event — returns immediately without synchronizing.
+    - ``get_finished``: queries the CUDA event to check whether the D2H
+      copy has completed, and reports finished request IDs.
+    - ``request_finished``: returns True while the store event is pending,
+      deferring GPU block deallocation.
+    - ``start_load_kv``: fires ``engine.retrieve`` and returns with
+      ``is_async=True`` so TRT-LLM parks the request until the load
+      stream completes (reported via ``get_finished``).
+
 Lifecycle (per TRT-LLM connector ABC):
     * scheduler.get_num_new_matched_tokens → engine.lookup(tokens)
     * scheduler.build_connector_meta → LMCacheConnectorMetadata(loads, saves)
     * worker.register_kv_caches → builds engine via _get_or_create_engine,
       calls gpu_connector.register_kv_caches(kv_cache_tensor)
-    * worker.start_load_kv → engine.retrieve(tokens, block_ids)
-    * worker.wait_for_save → engine.store(tokens, block_ids)
+    * worker.start_load_kv → engine.retrieve(tokens, block_ids) [non-blocking]
+    * worker.wait_for_save → engine.store(tokens, block_ids) [non-blocking]
 """
 
 # Standard
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import time
 
 # Third Party
@@ -135,6 +146,7 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
 
     Queries the LMCache engine for cached token counts and emits
     per-request load/save block specs for the worker to act on.
+    Returns ``is_async=True`` for loads so TRT-LLM parks the request.
     """
 
     def __init__(self, llm_args: TorchLlmArgs) -> None:
@@ -146,6 +158,8 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
         # Engine is created by the worker in register_kv_caches, which
         # may run concurrently with scheduler init. Resolved lazily.
         self._engine: Optional[LMCacheEngine] = None
+        # Track request IDs with in-flight saves for request_finished.
+        self._saving_in_flight: Set[int] = set()
 
     def get_num_new_matched_tokens(
         self,
@@ -155,14 +169,17 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
         """Return how many additional tokens LMCache can provide beyond
         ``num_computed_tokens`` (which TRT-LLM matched via GPU block reuse).
 
+        Returns ``is_async=True`` when there are tokens to load,
+        causing TRT-LLM to park the request until the worker reports
+        load completion via ``get_finished``.
+
         Args:
             request: The incoming request with its full token sequence.
             num_computed_tokens: Tokens already matched on device
                 (block-aligned).
 
         Returns:
-            ``(new_matched, is_async)``. ``is_async`` is always
-            ``False`` in this adapter.
+            ``(new_matched, is_async)``.
         """
         t0 = time.perf_counter()
 
@@ -201,24 +218,30 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
 
         self._pending[request.request_id] = (all_tokens, new_matched)
 
+        # Return is_async=True to park the request while loading.
+        is_async = new_matched > 0
+
         logger.debug(
             "LMCache TRT-LLM scheduler: req %d lookup=%.3fms total=%.3fms "
-            "trt_matched=%d lmcache_cached=%d new_matched=%d",
+            "trt_matched=%d lmcache_cached=%d new_matched=%d is_async=%s",
             request.request_id,
             (t2 - t1) * 1000,
             (time.perf_counter() - t0) * 1000,
             num_computed_tokens,
             cached_tokens,
             new_matched,
+            is_async,
         )
-        return new_matched, False
+        return new_matched, is_async
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> LMCacheConnectorMetadata:
         """Build per-request load/save specs from the pending lookup
-        results. The runtime binds the returned metadata to the worker
-        via ``bind_connector_meta`` before the forward pass starts.
+        results.
+
+        Requests that appear in saves are pre-registered in
+        ``_saving_in_flight`` so ``request_finished`` returns True.
         """
         meta = LMCacheConnectorMetadata()
 
@@ -245,6 +268,7 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
                 meta.saves[req.request_id] = _BlockSpec(
                     tokens=all_tokens, block_ids=block_ids
                 )
+                self._saving_in_flight.add(req.request_id)
 
         self._pending.clear()
         return meta
@@ -252,9 +276,15 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
         """Return whether async saving is in progress.
 
-        Always ``False`` — saves are synchronous in this adapter.
+        Returns ``True`` when a store is still in flight for this
+        request, deferring GPU block deallocation until ``get_finished``
+        on the worker reports it complete.
         """
-        return False
+        return request.request_id in self._saving_in_flight
+
+    def mark_save_finished(self, req_id: int) -> None:
+        """Called by the worker when the store CUDA event completes."""
+        self._saving_in_flight.discard(req_id)
 
     def update_state_after_alloc(
         self, request: LlmRequest, block_ids: List[int]
@@ -268,7 +298,8 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
 class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
     """Worker-side connector hook.
 
-    Performs GPU↔CPU KV transfers via the LMCache engine.
+    Performs non-blocking GPU↔CPU KV transfers via the LMCache engine.
+    Uses CUDA events to track completion without CPU synchronization.
     """
 
     def __init__(self, llm_args: TorchLlmArgs) -> None:
@@ -278,6 +309,18 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
         self._engine: Optional[LMCacheEngine] = None
         self._load_stream: Optional[torch_dev.Stream] = None
         self._store_stream: Optional[torch_dev.Stream] = None
+
+        # In-flight tracking: request_id -> CUDA event recorded after
+        # the store/load operations complete on their respective streams.
+        self._inflight_saves: Dict[int, torch.cuda.Event] = {}
+        self._inflight_loads: Dict[int, torch.cuda.Event] = {}
+
+        # Scheduler reference for marking saves as finished.
+        self._scheduler: Optional[LMCacheKvConnectorScheduler] = None
+
+    def set_scheduler(self, scheduler: "LMCacheKvConnectorScheduler") -> None:
+        """Wire the scheduler reference for cross-component coordination."""
+        self._scheduler = scheduler
 
     @property
     def _meta(self) -> Optional[LMCacheConnectorMetadata]:
@@ -302,31 +345,36 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
     def start_load_kv(self, stream: torch_dev.Stream) -> None:
         """Load KV blocks from LMCache into the GPU paged cache.
 
-        Retrieves all pending blocks on the load stream, then syncs the
-        forward-pass stream against it. The cross-layer format loads
-        every layer in a single kernel — no per-layer overlap to exploit.
+        Fires ``engine.retrieve`` on the load stream and records a CUDA
+        event for completion tracking. Does NOT synchronize the forward-
+        pass stream — TRT-LLM's async-load protocol parks the request
+        until ``get_finished`` reports it done.
         """
         meta = self._meta
         if meta is None or not meta.loads or self._engine is None:
             return
 
         t0 = time.perf_counter()
-        for spec in meta.loads.values():
+        for req_id, spec in meta.loads.items():
             if not spec.tokens or not spec.block_ids:
                 continue
             self._engine.retrieve(tokens=spec.tokens, block_ids=spec.block_ids)
-
-        if self._load_stream is not None:
-            stream.wait_stream(self._load_stream)
+            # Record an event on the load stream after all retrieve ops
+            # for this request have been enqueued.
+            if self._load_stream is not None:
+                event = torch_dev.Event()
+                event.record(self._load_stream)
+                self._inflight_loads[req_id] = event
 
         logger.debug(
-            "LMCache TRT-LLM worker: start_load_kv retrieve=%.3fms num_loads=%d",
-            (time.perf_counter() - t0) * 1000,
+            "LMCache TRT-LLM worker: start_load_kv submitted %d loads in %.3fms",
             len(meta.loads),
+            (time.perf_counter() - t0) * 1000,
         )
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch_dev.Stream) -> None:
-        """No-op — cross-layer loads complete in :meth:`start_load_kv`."""
+        """No-op — cross-layer loads complete asynchronously;
+        completion is reported via :meth:`get_finished`."""
         pass
 
     def save_kv_layer(self, layer_idx: int, stream: torch_dev.Stream) -> None:
@@ -336,36 +384,38 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
     def wait_for_save(self, stream: torch_dev.Stream) -> None:
         """Store newly computed KV blocks from GPU to LMCache's CPU cache.
 
-        Waits on the forward-pass stream, runs ``engine.store`` for each
-        request with new blocks, and synchronizes the store stream
-        before returning.
+        Enqueues the store on the store stream (which waits on ``stream``
+        for the forward pass to finish producing KV), records a CUDA
+        event, and returns immediately without CPU synchronization.
+        Completion is tracked via :meth:`get_finished`.
         """
         meta = self._meta
         if meta is None or not meta.saves or self._engine is None:
             return
 
         t0 = time.perf_counter()
+        # Make the store stream wait for the forward pass stream.
         if self._store_stream is not None:
             self._store_stream.wait_stream(stream)
-        t1 = time.perf_counter()
 
-        for spec in meta.saves.values():
+        for req_id, spec in meta.saves.items():
             if not spec.tokens or not spec.block_ids:
                 continue
             self._engine.store(tokens=spec.tokens, block_ids=spec.block_ids)
-        t2 = time.perf_counter()
 
+        # Record a single event after all stores for this batch — since
+        # they're all on the same store stream, one event suffices to
+        # indicate all preceding work is done.
         if self._store_stream is not None:
-            self._store_stream.synchronize()
-        t3 = time.perf_counter()
+            event = torch_dev.Event()
+            event.record(self._store_stream)
+            for req_id in meta.saves:
+                self._inflight_saves[req_id] = event
 
         logger.debug(
-            "LMCache TRT-LLM worker: wait_for_save stream_wait=%.3fms "
-            "store=%.3fms sync=%.3fms num_saves=%d",
-            (t1 - t0) * 1000,
-            (t2 - t1) * 1000,
-            (t3 - t2) * 1000,
+            "LMCache TRT-LLM worker: wait_for_save submitted %d stores in %.3fms",
             len(meta.saves),
+            (time.perf_counter() - t0) * 1000,
         )
 
     def get_finished(
@@ -373,5 +423,50 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
         finished_gen_req_ids: List[int],
         started_loading_req_ids: List[int],
     ) -> Tuple[List[int], List[int]]:
-        """All ops are synchronous here — nothing is ever pending."""
-        return [], []
+        """Poll CUDA events and report completed request IDs.
+
+        Per the TRT-LLM ABC contract:
+        - IDs may only be returned after they've been provided in the
+          corresponding input argument.
+        - The runtime takes action only once ALL workers report the same
+          ID (multi-rank allgather).
+
+        Returns:
+            Tuple of (finished_saving_ids, finished_loading_ids).
+        """
+        finished_saving: List[int] = []
+        finished_loading: List[int] = []
+
+        # Poll saves.
+        eligible_saves = set(finished_gen_req_ids)
+        for req_id in list(self._inflight_saves.keys()):
+            if req_id not in eligible_saves:
+                continue
+            event = self._inflight_saves[req_id]
+            if event.query():
+                del self._inflight_saves[req_id]
+                finished_saving.append(req_id)
+                if self._scheduler is not None:
+                    self._scheduler.mark_save_finished(req_id)
+
+        # Poll loads.
+        eligible_loads = set(started_loading_req_ids)
+        for req_id in list(self._inflight_loads.keys()):
+            if req_id not in eligible_loads:
+                continue
+            event = self._inflight_loads[req_id]
+            if event.query():
+                del self._inflight_loads[req_id]
+                finished_loading.append(req_id)
+
+        if finished_saving or finished_loading:
+            logger.debug(
+                "LMCache TRT-LLM worker: get_finished saves=%s loads=%s "
+                "(pending_saves=%d pending_loads=%d)",
+                finished_saving,
+                finished_loading,
+                len(self._inflight_saves),
+                len(self._inflight_loads),
+            )
+
+        return finished_saving, finished_loading
