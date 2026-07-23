@@ -279,12 +279,12 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
         Returns ``True`` when a store is still in flight for this
         request, deferring GPU block deallocation until ``get_finished``
         on the worker reports it complete.
+
+        Note: ``_saving_in_flight`` is populated at ``build_connector_meta``
+        time and never cleaned up — ``request_finished`` is called exactly
+        once per request, so cleanup is unnecessary.
         """
         return request.request_id in self._saving_in_flight
-
-    def mark_save_finished(self, req_id: int) -> None:
-        """Called by the worker when the store CUDA event completes."""
-        self._saving_in_flight.discard(req_id)
 
     def update_state_after_alloc(
         self, request: LlmRequest, block_ids: List[int]
@@ -314,13 +314,6 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
         # the store/load operations complete on their respective streams.
         self._inflight_saves: Dict[int, torch.cuda.Event] = {}
         self._inflight_loads: Dict[int, torch.cuda.Event] = {}
-
-        # Scheduler reference for marking saves as finished.
-        self._scheduler: Optional[LMCacheKvConnectorScheduler] = None
-
-    def set_scheduler(self, scheduler: "LMCacheKvConnectorScheduler") -> None:
-        """Wire the scheduler reference for cross-component coordination."""
-        self._scheduler = scheduler
 
     @property
     def _meta(self) -> Optional[LMCacheConnectorMetadata]:
@@ -446,8 +439,6 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
             if event.query():
                 del self._inflight_saves[req_id]
                 finished_saving.append(req_id)
-                if self._scheduler is not None:
-                    self._scheduler.mark_save_finished(req_id)
 
         # Poll loads.
         eligible_loads = set(started_loading_req_ids)

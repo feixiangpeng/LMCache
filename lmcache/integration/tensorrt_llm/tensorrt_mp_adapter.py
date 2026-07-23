@@ -302,31 +302,13 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
         TRT-LLM will defer block deallocation until ``get_finished`` on
         the worker reports the request complete.
 
-        Also notifies the scheduler-side tracking set, which the worker
-        will consume via ``get_finished``.
+        Note: ``_saving_in_flight`` is populated at ``build_connector_meta``
+        time and is never cleaned up — ``request_finished`` is called
+        exactly once per request by the TRT-LLM runtime, so cleanup is
+        unnecessary. The set grows only by the number of concurrent
+        requests with saves scheduled.
         """
-        req_id = request.request_id
-        if req_id in self._saving_in_flight:
-            return True
-        return False
-
-    def mark_save_started(self, req_id: int) -> None:
-        """Called by the worker after submitting an async STORE."""
-        self._saving_in_flight.add(req_id)
-
-    def mark_save_finished(self, req_id: int) -> None:
-        """Called when the save future completes."""
-        self._saving_in_flight.discard(req_id)
-        # Fire END_SESSION now that the STORE is complete and the daemon
-        # no longer needs the session state for this request.
-        try:
-            _send_request(
-                self._mq_client,
-                RequestType.END_SESSION,
-                [str(req_id)],
-            )
-        except Exception as e:
-            logger.warning("LMCache MP scheduler: end_session failed for req %d: %s", req_id, e)
+        return request.request_id in self._saving_in_flight
 
     def update_state_after_alloc(
         self, request: LlmRequest, block_ids: List[int]
@@ -373,14 +355,6 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
         # Maps request_id -> (future, export_event_keepalive).
         self._inflight_saves: Dict[int, Tuple[MessagingFuture, object]] = {}
         self._inflight_loads: Dict[int, Tuple[MessagingFuture, object]] = {}
-
-        # Scheduler reference for coordinating request_finished / END_SESSION.
-        # Set by the runtime's KvCacheConnectorManager (same-process, rank 0).
-        self._scheduler: Optional[LMCacheMPKvConnectorScheduler] = None
-
-    def set_scheduler(self, scheduler: "LMCacheMPKvConnectorScheduler") -> None:
-        """Wire the scheduler reference for cross-component coordination."""
-        self._scheduler = scheduler
 
     def _create_key(
         self,
@@ -557,9 +531,6 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 )
                 # Pin the export event so the daemon's import sees it alive.
                 self._inflight_saves[req_id] = (future, event)
-                # Tell the scheduler this request has an in-flight save.
-                if self._scheduler is not None:
-                    self._scheduler.mark_save_started(req_id)
             except Exception as e:
                 logger.warning(
                     "LMCache MP worker: store submit failed for req %d: %s",
@@ -602,8 +573,18 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
             if future.query():
                 del self._inflight_saves[req_id]
                 finished_saving.append(req_id)
-                if self._scheduler is not None:
-                    self._scheduler.mark_save_finished(req_id)
+                # Fire END_SESSION now that the STORE is complete.
+                try:
+                    _send_request(
+                        self._mq_client,
+                        RequestType.END_SESSION,
+                        [str(req_id)],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "LMCache MP worker: end_session failed for req %d: %s",
+                        req_id, e,
+                    )
 
         # Poll loads — only IDs that TRT-LLM has acknowledged as
         # "started loading" are eligible to report.

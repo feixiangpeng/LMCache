@@ -242,7 +242,6 @@ class TestMPAdapterAsyncStore:
         worker._mq_client = MagicMock()
         worker._inflight_saves = {}
         worker._inflight_loads = {}
-        worker._scheduler = None
         worker._metadata = None
         worker._llm_args = _FakeTorchLlmArgs()
         return worker, mp_mod
@@ -365,9 +364,9 @@ class TestMPAdapterAsyncStore:
         req = _FakeLlmRequest(request_id=42)
         assert sched.request_finished(req, []) is True
 
-        # After marking finished:
-        sched.mark_save_finished(42)
-        assert sched.request_finished(req, []) is False
+        # Without the save registered:
+        req2 = _FakeLlmRequest(request_id=99)
+        assert sched.request_finished(req2, []) is False
 
     def test_start_load_kv_does_not_block(self, monkeypatch):
         """start_load_kv must submit and return without calling .result()."""
@@ -495,7 +494,6 @@ class TestInProcessAdapterAsyncStore:
         worker._store_stream = _FakeStream()
         worker._inflight_saves = {}
         worker._inflight_loads = {}
-        worker._scheduler = None
         worker._metadata = None
         worker._llm_args = _FakeTorchLlmArgs()
         return worker, inproc_mod
@@ -571,8 +569,9 @@ class TestInProcessAdapterAsyncStore:
         req = _FakeLlmRequest(request_id=99)
         assert sched.request_finished(req, []) is True
 
-        sched.mark_save_finished(99)
-        assert sched.request_finished(req, []) is False
+        # Without the save registered:
+        req2 = _FakeLlmRequest(request_id=100)
+        assert sched.request_finished(req2, []) is False
 
     def test_start_load_kv_records_event(self, monkeypatch):
         """start_load_kv fires engine.retrieve and records an event."""
