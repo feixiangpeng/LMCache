@@ -106,14 +106,47 @@ TRT-LLM's async connector ABC (`get_finished` / `request_finished` /
 
 2. **Eligibility contract**: `get_finished` only returns IDs that have
    been passed in as `finished_gen_req_ids` / `started_loading_req_ids`.
-   The runtime allgathers across all workers — an ID is actionable only
-   once ALL workers have reported it.
+   TRT-LLM provides each ID exactly **once** (it drains
+   `new_async_requests` into `pending_async_requests` on the same call),
+   so eligibility must be **sticky**: the adapters record granted IDs in
+   `_eligible_saves` / `_eligible_loads` and clear them only when
+   reported. Treating eligibility as per-call state hangs any operation
+   that is still in flight on the call where its ID is first passed.
+   The runtime also allgathers across all workers — an ID is actionable
+   only once ALL workers have reported it.
 
-3. **END_SESSION ordering** (MP only): the daemon's `end_session`
+3. **No-future fallback (saves only)**: an eligible save ID with no
+   in-flight future (submit failed or skipped) is reported immediately —
+   otherwise TRT-LLM defers its block deallocation forever. Loads have
+   NO such fallback: falsely reporting a load done resumes the request
+   against unloaded KV (silent corruption beats a visible stall).
+
+4. **END_SESSION ordering** (MP only): the daemon's `end_session`
    handler cleans up per-request state (lookup locks, session hashes).
-   The scheduler defers `END_SESSION` until `mark_save_finished` is
-   called, ensuring the daemon's STORE handler has finished using the
-   session state.
+   The worker fires `END_SESSION` from `get_finished` only after the
+   STORE future completes, ensuring the daemon's STORE handler has
+   finished using the session state.
+
+### Async-load scheduling (the parked-request path)
+
+When `get_num_new_matched_tokens` returns `is_async=True`, TRT-LLM
+**excludes the request from the scheduler output** (see
+`build_scheduler_output` in TRT-LLM's `kv_cache_connector.py`) and
+removes it from the scheduled batch. The executor's call order is:
+
+1. `prepare_resources` — allocates blocks (request still in batch),
+   calls `update_state_after_alloc(req, block_ids)`, then builds the
+   scheduler output **without** the async-loading request.
+2. `handle_metadata` — `build_connector_meta(scheduler_output)`; the
+   loading request is absent from `scheduler_output.new_requests`.
+3. `_kv_connector_start_batch` — removes the request from the batch,
+   then calls `start_load_kv`.
+
+The adapters therefore capture block_ids for async-loading requests in
+`update_state_after_alloc` (`_pending_async_loads`) and inject them into
+`metadata.loads` in `build_connector_meta`. Relying on
+`scheduler_output.new_requests` alone deadlocks: the load never starts,
+and the request stays parked forever.
 
 ### Scheduler ↔ Worker coordination
 

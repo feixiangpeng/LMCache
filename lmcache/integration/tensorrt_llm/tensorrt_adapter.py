@@ -264,7 +264,8 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
             save_start = max(num_computed_blocks, num_matched // self._block_size)
             num_full_new_blocks = len(req.new_tokens) // self._block_size
             if (
-                save_start < len(block_ids)
+                all_tokens
+                and save_start < len(block_ids)
                 and num_full_new_blocks > 0
                 and save_start < num_computed_blocks + num_full_new_blocks
             ):
@@ -337,6 +338,11 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
         # the store/load operations complete on their respective streams.
         self._inflight_saves: Dict[int, torch.cuda.Event] = {}
         self._inflight_loads: Dict[int, torch.cuda.Event] = {}
+        # Sticky eligibility: TRT-LLM passes each request ID in
+        # finished_gen_req_ids / started_loading_req_ids exactly ONCE.
+        # Once granted, eligibility persists until the ID is reported.
+        self._eligible_saves: Set[int] = set()
+        self._eligible_loads: Set[int] = set()
 
     @property
     def _meta(self) -> Optional[LMCacheConnectorMetadata]:
@@ -443,7 +449,9 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
 
         Per the TRT-LLM ABC contract:
         - IDs may only be returned after they've been provided in the
-          corresponding input argument.
+          corresponding input argument. The runtime provides each ID
+          exactly ONCE, so eligibility is sticky: granted on first
+          appearance, cleared only when the ID is reported back.
         - The runtime takes action only once ALL workers report the same
           ID (multi-rank allgather).
 
@@ -454,23 +462,32 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
         finished_loading: List[int] = []
 
         # Poll saves.
-        eligible_saves = set(finished_gen_req_ids)
+        self._eligible_saves.update(finished_gen_req_ids)
+        # An eligible ID with no in-flight event (e.g. the store was
+        # skipped) has nothing to wait for — report it immediately, or
+        # the runtime would defer its block deallocation forever.
+        for req_id in list(self._eligible_saves):
+            if req_id not in self._inflight_saves:
+                self._eligible_saves.discard(req_id)
+                finished_saving.append(req_id)
         for req_id in list(self._inflight_saves.keys()):
-            if req_id not in eligible_saves:
+            if req_id not in self._eligible_saves:
                 continue
             event = self._inflight_saves[req_id]
             if event.query():
                 del self._inflight_saves[req_id]
+                self._eligible_saves.discard(req_id)
                 finished_saving.append(req_id)
 
         # Poll loads.
-        eligible_loads = set(started_loading_req_ids)
+        self._eligible_loads.update(started_loading_req_ids)
         for req_id in list(self._inflight_loads.keys()):
-            if req_id not in eligible_loads:
+            if req_id not in self._eligible_loads:
                 continue
             event = self._inflight_loads[req_id]
             if event.query():
                 del self._inflight_loads[req_id]
+                self._eligible_loads.discard(req_id)
                 finished_loading.append(req_id)
 
         if finished_saving or finished_loading:

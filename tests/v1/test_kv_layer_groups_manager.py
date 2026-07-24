@@ -110,6 +110,30 @@ class TestKVLayerGroupsManager:
         )
         assert by_group[1].engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_HS
 
+    def test_build_cross_layer_fused_tensor(self):
+        """Cross-layer format (TRT-LLM): kv_caches is a single fused tensor
+        ``[NB, NL, 2, NH, BS, HS]``, not a per-layer list. Regression for
+        the MP-server registration path — indexing the tensor per-layer
+        would slice blocks, not layers."""
+        # First Party
+        import lmcache.c_ops as lmc_ops
+
+        nb, nl, nh, bs, hs = 16, 4, 2, 64, 64
+        fused = torch.randn(nb, nl, 2, nh, bs, hs, dtype=torch.bfloat16)
+        manager = KVLayerGroupsManager(
+            fused,
+            engine_kv_formats=[lmc_ops.EngineKVFormat.NB_NL_TWO_NH_BS_HS] * nl,
+        )
+
+        assert len(manager.kernel_groups) == 1
+        group = manager.kernel_groups[0]
+        assert group.shape_desc.nb == nb
+        assert group.shape_desc.nl == nl
+        assert group.shape_desc.nh == nh
+        assert group.shape_desc.bs == bs
+        assert group.shape_desc.hs == hs
+        assert group.shape_desc.kv_size == 2
+
     def test_build_multiple_layers_same_shape(self):
         tensors = [
             torch.randn(2, 32, 256, 8, 64, dtype=torch.float16) for _ in range(3)

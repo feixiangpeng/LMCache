@@ -145,6 +145,8 @@ def _make_mp_worker() -> LMCacheMPKvConnectorWorker:
     worker._mq_client = MagicMock()
     worker._inflight_saves = {}
     worker._inflight_loads = {}
+    worker._eligible_saves = set()
+    worker._eligible_loads = set()
     worker._metadata = None
     return worker
 
@@ -172,6 +174,8 @@ def _make_inproc_worker() -> LMCacheKvConnectorWorker:
     worker._store_stream = _FakeStream()
     worker._inflight_saves = {}
     worker._inflight_loads = {}
+    worker._eligible_saves = set()
+    worker._eligible_loads = set()
     worker._metadata = None
     return worker
 
@@ -260,6 +264,44 @@ class TestMPAdapterAsyncStore:
         saves, loads = worker.get_finished([], [])
         assert saves == []
         assert 99 in worker._inflight_saves  # still tracked
+
+    def test_get_finished_eligibility_is_sticky(self):
+        """TRT-LLM passes each ID exactly once. If the operation is still
+        pending at that moment, the ID must stay eligible and be reported
+        by a LATER get_finished call — regression for the MP async-load
+        hang where a slow RETRIEVE was never reported."""
+        worker = _make_mp_worker()
+
+        pending_future = _SpyFuture(value=True)
+        worker._inflight_loads = {8: (pending_future, _FakeEvent())}
+
+        # Eligibility granted while the future is still pending.
+        saves, loads = worker.get_finished([], [8])
+        assert loads == []
+        assert 8 in worker._inflight_loads
+
+        # Future completes; the next call passes EMPTY args (TRT-LLM
+        # only provides each ID once) — must still report it.
+        pending_future.mark_done()
+        saves, loads = worker.get_finished([], [])
+        assert loads == [8]
+        assert 8 not in worker._inflight_loads
+
+    def test_get_finished_reports_eligible_save_with_no_future(self):
+        """A save ID that becomes eligible but has no in-flight future
+        (e.g. the batch was reverted after build_connector_meta registered
+        the save, so wait_for_save never fired) must be reported
+        immediately — otherwise TRT-LLM defers the request's block
+        deallocation forever and the KV pool starves."""
+        worker = _make_mp_worker()
+        assert worker._inflight_saves == {}
+
+        saves, loads = worker.get_finished([77], [])
+        assert saves == [77]
+
+        # Reported once; not again.
+        saves, loads = worker.get_finished([], [])
+        assert saves == []
 
     def test_get_finished_fires_end_session_on_save_completion(self, monkeypatch):
         """END_SESSION goes out only after the STORE completes."""

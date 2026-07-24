@@ -282,7 +282,8 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
             save_start = max(num_computed_blocks, num_matched // self._block_size)
             num_full_new_blocks = len(req.new_tokens) // self._block_size
             if (
-                save_start < len(block_ids)
+                all_tokens
+                and save_start < len(block_ids)
                 and num_full_new_blocks > 0
                 and save_start < num_computed_blocks + num_full_new_blocks
             ):
@@ -377,6 +378,11 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
         # Maps request_id -> (future, export_event_keepalive).
         self._inflight_saves: Dict[int, Tuple[MessagingFuture, object]] = {}
         self._inflight_loads: Dict[int, Tuple[MessagingFuture, object]] = {}
+        # Sticky eligibility: TRT-LLM passes each request ID in
+        # finished_gen_req_ids / started_loading_req_ids exactly ONCE.
+        # Once granted, eligibility persists until the ID is reported.
+        self._eligible_saves: Set[int] = set()
+        self._eligible_loads: Set[int] = set()
 
     def _create_key(
         self,
@@ -480,6 +486,11 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
 
         for req_id, spec in meta.loads.items():
             if not spec.tokens or not spec.block_ids:
+                logger.warning(
+                    "LMCache MP worker: skipping load for req %d "
+                    "(tokens=%d block_ids=%d)",
+                    req_id, len(spec.tokens), len(spec.block_ids),
+                )
                 continue
 
             key = self._create_key(spec.tokens, req_id)
@@ -537,6 +548,13 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
 
         for req_id, spec in meta.saves.items():
             if not spec.tokens or not spec.block_ids:
+                # No future is created; get_finished's no-future fallback
+                # reports this ID immediately so its blocks are freed.
+                logger.warning(
+                    "LMCache MP worker: skipping save for req %d "
+                    "(tokens=%d block_ids=%d)",
+                    req_id, len(spec.tokens), len(spec.block_ids),
+                )
                 continue
 
             key = self._create_key(spec.tokens, req_id)
@@ -576,6 +594,8 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
         Per the TRT-LLM ABC contract (kv_cache_connector.py:174-196):
         - IDs may only be returned from this call after they've been
           provided in ``finished_gen_req_ids`` / ``started_loading_req_ids``.
+          The runtime provides each ID exactly ONCE, so eligibility is
+          sticky: granted on first appearance, cleared when reported.
         - The runtime will only take action once ALL workers report the
           same ID (multi-rank allgather).
 
@@ -587,13 +607,21 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
 
         # Poll saves — only IDs that TRT-LLM has acknowledged as
         # "finished generation, now saving" are eligible to report.
-        eligible_saves = set(finished_gen_req_ids)
+        self._eligible_saves.update(finished_gen_req_ids)
+        # An eligible ID with no in-flight future (e.g. the STORE submit
+        # failed) has nothing to wait for — report it immediately, or the
+        # runtime would defer its block deallocation forever.
+        for req_id in list(self._eligible_saves):
+            if req_id not in self._inflight_saves:
+                self._eligible_saves.discard(req_id)
+                finished_saving.append(req_id)
         for req_id in list(self._inflight_saves.keys()):
-            if req_id not in eligible_saves:
+            if req_id not in self._eligible_saves:
                 continue
             future, _event = self._inflight_saves[req_id]
             if future.query():
                 del self._inflight_saves[req_id]
+                self._eligible_saves.discard(req_id)
                 finished_saving.append(req_id)
                 # Fire END_SESSION now that the STORE is complete.
                 try:
@@ -609,14 +637,18 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                     )
 
         # Poll loads — only IDs that TRT-LLM has acknowledged as
-        # "started loading" are eligible to report.
-        eligible_loads = set(started_loading_req_ids)
+        # "started loading" are eligible to report. No immediate-report
+        # fallback here (unlike saves): falsely reporting a load done
+        # would resume the request against unloaded KV blocks — silent
+        # corruption is worse than a visible stall.
+        self._eligible_loads.update(started_loading_req_ids)
         for req_id in list(self._inflight_loads.keys()):
-            if req_id not in eligible_loads:
+            if req_id not in self._eligible_loads:
                 continue
             future, _event = self._inflight_loads[req_id]
             if future.query():
                 del self._inflight_loads[req_id]
+                self._eligible_loads.discard(req_id)
                 finished_loading.append(req_id)
 
         if finished_saving or finished_loading:

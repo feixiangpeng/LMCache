@@ -55,6 +55,7 @@ def main() -> int:
         kv_connector_config=connector_cfg,
         max_batch_size=2,
         max_seq_len=2048,
+        tensor_parallel_size=int(os.environ.get("SMOKE_TP", "1")),
     )
 
     # A long, deterministic prompt (many chunks of 64 tokens).
