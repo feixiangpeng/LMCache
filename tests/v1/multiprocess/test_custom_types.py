@@ -15,7 +15,10 @@ from lmcache.v1.multiprocess.custom_types import (
     get_customized_decoder,
     get_customized_encoder,
 )
-from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
+from lmcache.v1.platform.cuda.ipc_wrapper import (
+    CudaIPCWrapper,
+    RawCudaIPCWrapper,
+)
 
 
 def test_ipc_cache_engine_key_serialization():
@@ -323,6 +326,160 @@ def test_cudaipc_wrapper_nonzero_storage_offset():
     assert shape == list(view.shape)
     assert stride == list(view.stride())
     assert abs(checksum - float(view.sum().cpu().item())) < 1e-5
+
+
+def _worker_reconstruct_raw_from_other_device(
+    encoded_data: bytes, result_queue: Queue
+):
+    """Worker: decode a ``RawCudaIPCWrapper`` and reconstruct it while the
+    importer's *current* device is ``cuda:0`` (not the exporting device).
+
+    This models the TRT-LLM TP>1 topology: rank 1 exports a KV pool on
+    ``cuda:1``, but the MP server thread that reconstructs it may have a
+    different device current. ``cudaIpcOpenMemHandle`` maps the buffer for
+    peer access from whatever device is *current* at open time, so
+    ``to_tensor`` must set the exporting device around the open; otherwise
+    the mapping is established for ``cuda:0`` and a later kernel on
+    ``cuda:1``'s stream dereferences a pointer invalid on that device.
+
+    The reconstructed tensor reports ``cuda:1`` either way (its device is
+    derived from the pointer's UUID, not the open-time current device), so
+    device placement is NOT the discriminating signal -- the *readback* is:
+    ``tensor.sum()`` launches a kernel on the tensor's own ``cuda:1``
+    stream, which faults under the wrong-device open and succeeds under the
+    fix. A fault here raises, so the worker reports ``"error"`` (or crashes
+    with a nonzero exit code) and the parent's success assertion fails.
+    """
+    try:
+        torch.cuda.init()
+        # Pin the importer's current device to 0 -- deliberately NOT the
+        # exporting device -- so a wrong-device open maps for cuda:0 while
+        # the readback kernel runs on the tensor's own cuda:1 stream.
+        torch.cuda.set_device(0)
+        decoder = get_customized_decoder(type=RawCudaIPCWrapper)
+        wrapper = decoder.decode(encoded_data)
+        tensor = wrapper.to_tensor()
+        # The discriminating read: a kernel on the reconstructed tensor's
+        # own device stream. This is what faulted under the bug.
+        checksum = float(tensor.sum().cpu().item())
+        result_queue.put(
+            (
+                "success",
+                tensor.device.index,
+                list(tensor.shape),
+                checksum,
+            )
+        )
+    except Exception as e:
+        result_queue.put(("error", str(e), None, None))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="RawCudaIPCWrapper cross-device import test requires >=2 GPUs",
+)
+def test_rawcudaipc_wrapper_reconstructs_on_exporting_device():
+    """``RawCudaIPCWrapper.to_tensor`` must open the IPC handle with the
+    *exporting* device current, so a later kernel on the reconstructed
+    tensor's own stream can read it.
+
+    Regression test for the TRT-LLM TP>1 crash: each rank exports a KV
+    pool on its own physical device (rank 1 -> ``cuda:1``), but
+    ``cudaIpcOpenMemHandle`` maps the buffer for peer access from whatever
+    device is *current* at open time. Opening under the default ``cuda:0``
+    mapped rank 1's pool for the wrong device; the transfer kernel --
+    launched on the reconstructed context's own ``cuda:1`` stream -- then
+    dereferenced a pointer invalid on that device, surfacing as a CUDA
+    "illegal memory access". The fix wraps the open in
+    ``with cupy.cuda.Device(index)``.
+
+    The buffer is exported on ``cuda:1`` and reconstructed in a worker
+    whose current device is pinned to ``cuda:0``. The reconstructed tensor
+    reports ``cuda:1`` in both the broken and fixed cases (its device comes
+    from the pointer UUID, not the open-time current device), so the
+    discriminator is the readback: the pre-fix open faults when the worker
+    reads the tensor on its ``cuda:1`` stream, while the fixed open reads
+    the exported ``arange`` pattern back verbatim.
+    """
+    # Third Party
+    import cupy
+
+    try:
+        # Third Party
+        from cuda.bindings import runtime as cudart
+    except ImportError:
+        # Third Party
+        from cuda import cudart
+
+    exporter_index = 1
+    num_elems = 256
+    nbytes = num_elems * 4
+
+    # Allocate a raw cudaMalloc'd buffer on cuda:1 -- a genuine allocation
+    # base pointer, as cudaIpcGetMemHandle requires, and outside PyTorch's
+    # caching allocator (the exact TRT-LLM pool shape RawCudaIPCWrapper
+    # targets; CuPy's pool sub-allocates and would not give a valid IPC
+    # base). Fill it with arange so each element pins its storage index.
+    with cupy.cuda.Device(exporter_index):
+        err, raw_ptr = cudart.cudaMalloc(nbytes)
+        assert err == cudart.cudaError_t.cudaSuccess, f"cudaMalloc: {err}"
+        mem = cupy.cuda.UnownedMemory(raw_ptr, nbytes, owner=None)
+        memptr = cupy.cuda.MemoryPointer(mem, 0)
+        cp_view = cupy.ndarray((num_elems,), dtype=cupy.float32, memptr=memptr)
+        cp_view[...] = cupy.arange(num_elems, dtype=cupy.float32)
+        exported = torch.from_dlpack(cp_view)
+        assert exported.device.index == exporter_index
+
+        wrapper = RawCudaIPCWrapper(exported)
+
+    expected_checksum = float(num_elems * (num_elems - 1) / 2)
+
+    encoder = get_customized_encoder(type=RawCudaIPCWrapper)
+    encoded = encoder.encode(wrapper)
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_worker_reconstruct_raw_from_other_device,
+        args=(encoded, result_queue),
+    )
+    process.start()
+    process.join(timeout=30)
+
+    try:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            pytest.fail("Worker process timed out")
+        assert process.exitcode == 0, (
+            f"Worker process failed with exit code {process.exitcode} "
+            "(a CUDA illegal-access crash indicates the wrong-device import)"
+        )
+        assert not result_queue.empty(), "No result received from worker process"
+
+        status, device_index, shape, checksum = result_queue.get()
+        # The core assertion: the readback succeeded. Under the pre-fix
+        # wrong-device open, tensor.sum() in the worker faults with a CUDA
+        # illegal access -> status == "error" (device_index carries the
+        # exception string).
+        assert status == "success", (
+            f"Worker reconstruction/readback failed (wrong-device IPC "
+            f"import regression): {device_index}"
+        )
+        # Sanity: the tensor lands on the exporting device (true both
+        # before and after the fix -- device comes from the pointer UUID).
+        assert device_index == exporter_index, (
+            f"reconstructed on cuda:{device_index}, expected the exporting "
+            f"device cuda:{exporter_index}"
+        )
+        assert shape == [num_elems]
+        # The readback read the correct storage region (arange sum).
+        assert abs(checksum - expected_checksum) < 1e-3
+    finally:
+        # Keep the source allocation alive until the child has opened its
+        # own mapping (join above), then release it.
+        with cupy.cuda.Device(exporter_index):
+            cudart.cudaFree(raw_ptr)
 
 
 def test_block_allocation_record_serialization():

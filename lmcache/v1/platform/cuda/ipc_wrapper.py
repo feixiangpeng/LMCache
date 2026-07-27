@@ -152,7 +152,21 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         self.device_uuid = self._get_device_uuid(device_index)
 
     def to_tensor(self) -> torch.Tensor:
-        """Reconstruct the tensor in this process via raw CUDA IPC."""
+        """Reconstruct the tensor in this process via raw CUDA IPC.
+
+        ``cudaIpcOpenMemHandle`` maps the exported buffer into the
+        *currently active* CUDA device, so the import MUST run with the
+        exporting device current. Under tensor parallelism each rank
+        exports a KV pool on its own physical device (rank 1 -> cuda:1);
+        opening the handle under the default device (cuda:0) maps the
+        pool for peer access from the wrong device, and the transfer
+        kernel -- later launched on this context's own device stream --
+        then dereferences a pointer that is not valid on that device,
+        surfacing as a CUDA "illegal memory access". Setting the device
+        around the open keeps the mapping native to the device the
+        kernel runs on. This is a no-op for the single-device (cuda:0)
+        case, so it does not regress TP=1.
+        """
         # Third Party
         import cupy
 
@@ -167,17 +181,19 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
 
         handle = cudart.cudaIpcMemHandle_t()
         handle.reserved = self._ipc_handle_reserved
-        err, ptr = cudart.cudaIpcOpenMemHandle(
-            handle, cudart.cudaIpcMemLazyEnablePeerAccess
-        )
-        if err != cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
 
-        # Wrap as a flat ``uint8`` CuPy array, DLPack to torch, then view
-        # as the original dtype/shape. ``uint8`` avoids dtype-conversion
-        # gaps (bfloat16, fp8 have no direct CuPy/NumPy equivalent without
-        # ml_dtypes).
+        # Open the handle AND wrap the pointer with the exporting device
+        # current: the mapping and the transfer kernel that later reads it
+        # must agree on the device (see docstring). ``uint8`` avoids
+        # dtype-conversion gaps (bfloat16, fp8 have no direct CuPy/NumPy
+        # equivalent without ml_dtypes).
         with cupy.cuda.Device(device_index):
+            err, ptr = cudart.cudaIpcOpenMemHandle(
+                handle, cudart.cudaIpcMemLazyEnablePeerAccess
+            )
+            if err != cudart.cudaError_t.cudaSuccess:
+                raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
+
             mem = cupy.cuda.UnownedMemory(ptr, self._nbytes, owner=self)
             memptr = cupy.cuda.MemoryPointer(mem, 0)
             cp_flat = cupy.ndarray(self._nbytes, dtype=cupy.uint8, memptr=memptr)
