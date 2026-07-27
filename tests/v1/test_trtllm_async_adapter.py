@@ -536,6 +536,80 @@ class TestInProcessAdapterAsyncStore:
 
 
 # ---------------------------------------------------------------------------
+# Overlay path: partial TRT-LLM device match + fuller LMCache match
+# ---------------------------------------------------------------------------
+
+
+class TestInProcessOverlayMath:
+    """Verify the remainder math when TRT-LLM already matched some tokens.
+
+    When TRT-LLM's own block reuse supplies ``num_computed_tokens`` on
+    device and LMCache holds ``cached`` tokens total, the scheduler must
+    load only the non-overlapping, block-aligned remainder:
+    ``new_matched == align_down(cached - num_computed, block)``. This is
+    exercised incidentally in the e2e runs but is asserted deterministically
+    here because forcing exact partial device residency from outside
+    TRT-LLM's LRU is unreliable.
+    """
+
+    def test_overlay_loads_only_remainder(self):
+        """cached=576, TRT matched 128 -> load the aligned remainder (448)."""
+        sched = _make_inproc_scheduler()
+        mock_engine = MagicMock()
+        mock_engine.lookup.return_value = 576
+        sched._engine = mock_engine
+
+        req = _FakeLlmRequest(request_id=1, _tokens=list(range(1024)))
+        new_matched, is_async = sched.get_num_new_matched_tokens(req, 128)
+
+        assert new_matched == 448  # align_down(576 - 128, 64)
+        assert is_async is True
+
+    def test_overlay_result_is_block_aligned(self):
+        """A non-block-multiple overlap is floored to the block boundary."""
+        sched = _make_inproc_scheduler()
+        mock_engine = MagicMock()
+        # cached - num_computed = 600 - 128 = 472; align_down(472, 64) = 448.
+        mock_engine.lookup.return_value = 600
+        sched._engine = mock_engine
+
+        req = _FakeLlmRequest(request_id=2, _tokens=list(range(1024)))
+        new_matched, is_async = sched.get_num_new_matched_tokens(req, 128)
+
+        assert new_matched == 448
+        assert is_async is True
+
+    def test_no_overlay_when_trt_covers_lmcache(self):
+        """TRT already matched >= what LMCache holds -> nothing new to load."""
+        sched = _make_inproc_scheduler()
+        mock_engine = MagicMock()
+        mock_engine.lookup.return_value = 256
+        sched._engine = mock_engine
+
+        req = _FakeLlmRequest(request_id=3, _tokens=list(range(1024)))
+        # TRT matched 256; LMCache holds 256 -> remainder 0.
+        new_matched, is_async = sched.get_num_new_matched_tokens(req, 256)
+
+        assert new_matched == 0
+        assert is_async is False
+
+    def test_short_circuit_when_trt_matched_all_blocks(self):
+        """When TRT covers every full block, lookup is skipped entirely."""
+        sched = _make_inproc_scheduler()
+        mock_engine = MagicMock()
+        sched._engine = mock_engine
+
+        # 640 tokens -> 10 full blocks (max_block_aligned = 640). TRT
+        # matched all 640 -> scheduler short-circuits before calling lookup.
+        req = _FakeLlmRequest(request_id=4, _tokens=list(range(640)))
+        new_matched, is_async = sched.get_num_new_matched_tokens(req, 640)
+
+        assert new_matched == 0
+        assert is_async is False
+        mock_engine.lookup.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Cache salt isolation tests
 # ---------------------------------------------------------------------------
 
