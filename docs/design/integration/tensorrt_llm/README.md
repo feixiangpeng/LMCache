@@ -127,6 +127,17 @@ TRT-LLM's async connector ABC (`get_finished` / `request_finished` /
    STORE future completes, ensuring the daemon's STORE handler has
    finished using the session state.
 
+5. **Cache salt isolation**: requests with different `cache_salt` values
+   produce separate cache entries. `LlmRequest.cache_salt` (or `""` if
+   absent) is captured at `get_num_new_matched_tokens` time and threaded
+   through `_pending` into `_BlockSpec.cache_salt`. In-process mode
+   passes it as `request_configs={"lmcache.tag.cache_salt": salt}` so
+   the `CacheEngineKey` identity includes the salt. MP mode sets
+   `IPCCacheServerKey.cache_salt` in both scheduler and worker
+   `_create_key` methods, propagating through LOOKUP, STORE, and
+   RETRIEVE messages. Missing this plumbing causes cross-salt cache
+   pollution — user A's KV served to user B.
+
 ### Async-load scheduling (the parked-request path)
 
 When `get_num_new_matched_tokens` returns `is_async=True`, TRT-LLM
