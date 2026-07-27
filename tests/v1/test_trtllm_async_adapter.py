@@ -846,3 +846,239 @@ class TestMPCacheSaltIsolation:
         meta = sched.build_connector_meta(sched_output)
         assert meta.loads[3].cache_salt == "my-salt"
         assert meta.saves[3].cache_salt == "my-salt"
+
+
+# ---------------------------------------------------------------------------
+# Abort / cancel cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestAbortCancelCleanup:
+    """Cancelled requests must drain the adapters' tracking sets cleanly.
+
+    TRT-LLM has no dedicated abort hook on the connector ABC. Instead,
+    ``PyExecutor._handle_canceled_requests`` marks a cancelled request
+    finished (``request.finish_by_reason(FinishReason.CANCELLED)``) with
+    the explicit intent to "reuse all existing code to clean up the KV
+    cache resources" (py_executor.py:6596-6600). A finished request then
+    flows through the SAME hooks a normally-finished one does:
+    ``_send_kv_async`` calls ``kv_connector_request_finished`` for every
+    ``req.is_finished`` (py_executor.py:6048-6050), which drives
+    ``request_finished`` on the scheduler and ``get_finished`` on the
+    worker every iteration.
+
+    So there is no cancel-specific code in the adapters to exercise; the
+    property under test is that the ordinary drain is *complete* under a
+    cancel, i.e. no leak (saves) and no early report (loads). These tests
+    drive the exact call sequence TRT-LLM issues on cancel and assert the
+    tracking sets end empty.
+    """
+
+    # -- saves: leak-prevention -------------------------------------------
+
+    def test_inproc_cancel_during_inflight_save_drains(self):
+        """Cancel with a completed store: scheduler + worker sets drain.
+
+        The request was registered for saving (build_connector_meta added
+        it to ``_saving_in_flight`` and wait_for_save recorded an event).
+        On cancel TRT-LLM calls ``request_finished`` (returns True →
+        deallocation deferred), then ``get_finished`` reports the ID once
+        its CUDA event is done and frees the deferral.
+        """
+        sched = _make_inproc_scheduler()
+        worker = _make_inproc_worker()
+
+        sched._saving_in_flight.add(42)
+        done_event = _FakeEvent()
+        done_event.mark_done()
+        worker._inflight_saves = {42: done_event}
+
+        # request_finished: True exactly once, drains the scheduler set.
+        req = _FakeLlmRequest(request_id=42)
+        assert sched.request_finished(req, []) is True
+        assert 42 not in sched._saving_in_flight
+
+        # get_finished: event done → reported and every set drains.
+        saves, loads = worker.get_finished([42], [])
+        assert saves == [42]
+        assert loads == []
+        assert worker._inflight_saves == {}
+        assert worker._eligible_saves == set()
+
+    def test_inproc_cancel_during_pending_save_defers_then_drains(self):
+        """Cancel with a still-running store must not strand the ID.
+
+        TRT-LLM passes the ID to ``get_finished`` exactly once. If the
+        store event is not yet done at that moment, eligibility is sticky:
+        the ID stays tracked and is reported by a LATER call (with empty
+        args) once the event completes. A cancel must not defeat this.
+        """
+        sched = _make_inproc_scheduler()
+        worker = _make_inproc_worker()
+
+        sched._saving_in_flight.add(7)
+        pending_event = _FakeEvent()  # not done
+        worker._inflight_saves = {7: pending_event}
+
+        assert sched.request_finished(_FakeLlmRequest(request_id=7), []) is True
+
+        # First poll: eligible but event pending → not reported, still held.
+        saves, _loads = worker.get_finished([7], [])
+        assert saves == []
+        assert 7 in worker._inflight_saves
+        assert 7 in worker._eligible_saves
+
+        # Store completes; TRT-LLM passes EMPTY args (ID already provided).
+        pending_event.mark_done()
+        saves, _loads = worker.get_finished([], [])
+        assert saves == [7]
+        assert worker._inflight_saves == {}
+        assert worker._eligible_saves == set()
+
+    def test_inproc_cancel_of_save_with_no_event_reports_immediately(self):
+        """Cancel before wait_for_save ran: the save ID has no event.
+
+        A request can be registered in ``_saving_in_flight`` yet be
+        cancelled before the worker recorded a store event (the batch was
+        reverted, or cancel landed between build_connector_meta and
+        wait_for_save). The eligible-with-no-event fallback must report it
+        at once, or TRT-LLM defers its block deallocation forever.
+        """
+        sched = _make_inproc_scheduler()
+        worker = _make_inproc_worker()
+
+        sched._saving_in_flight.add(5)
+        assert worker._inflight_saves == {}
+
+        assert sched.request_finished(_FakeLlmRequest(request_id=5), []) is True
+        saves, _loads = worker.get_finished([5], [])
+        assert saves == [5]
+        assert worker._eligible_saves == set()
+
+    def test_mp_cancel_during_inflight_save_drains(self, monkeypatch):
+        """MP variant: completed store future drains all sets on cancel."""
+        worker = _make_mp_worker()
+        sched = _make_mp_scheduler()
+
+        monkeypatch.setattr(mp_mod, "_send_request", lambda *a, **kw: _SpyFuture())
+
+        sched._saving_in_flight.add(42)
+        done_future = _SpyFuture(value=True)
+        done_future.mark_done()
+        worker._inflight_saves = {42: (done_future, _FakeEvent())}
+
+        assert sched.request_finished(_FakeLlmRequest(request_id=42), []) is True
+        assert 42 not in sched._saving_in_flight
+
+        saves, loads = worker.get_finished([42], [])
+        assert saves == [42]
+        assert loads == []
+        assert worker._inflight_saves == {}
+        assert worker._eligible_saves == set()
+
+    def test_mp_cancel_during_pending_save_defers_then_drains(self, monkeypatch):
+        """MP variant: a still-pending store future is not stranded."""
+        worker = _make_mp_worker()
+        monkeypatch.setattr(mp_mod, "_send_request", lambda *a, **kw: _SpyFuture())
+
+        pending_future = _SpyFuture(value=True)  # not done
+        worker._inflight_saves = {7: (pending_future, _FakeEvent())}
+
+        saves, _loads = worker.get_finished([7], [])
+        assert saves == []
+        assert 7 in worker._inflight_saves
+        assert 7 in worker._eligible_saves
+
+        pending_future.mark_done()
+        saves, _loads = worker.get_finished([], [])
+        assert saves == [7]
+        assert worker._inflight_saves == {}
+        assert worker._eligible_saves == set()
+
+    # -- loads: corruption-prevention -------------------------------------
+
+    def test_inproc_cancel_during_inflight_load_no_early_report(self):
+        """A cancelled, still-loading request must NOT be reported early.
+
+        TRT-LLM moves a request reported as finished-loading back to
+        ``CONTEXT_INIT`` to be rescheduled (kv_cache_connector.py:615-617).
+        Reporting a load before its retrieve completes would resume decode
+        against unloaded KV — silent corruption. Loads therefore have no
+        immediate-report fallback, even under cancel. Once the load event
+        does complete, the ID drains normally.
+        """
+        worker = _make_inproc_worker()
+
+        pending_event = _FakeEvent()  # retrieve still running
+        worker._inflight_loads = {8: pending_event}
+
+        # Cancel arrives while loading: eligible, but event pending →
+        # must stay tracked and unreported.
+        saves, loads = worker.get_finished([], [8])
+        assert saves == []
+        assert loads == []
+        assert 8 in worker._inflight_loads
+
+        # Retrieve finishes; the ID drains on the next poll.
+        pending_event.mark_done()
+        _saves, loads = worker.get_finished([], [])
+        assert loads == [8]
+        assert worker._inflight_loads == {}
+        assert worker._eligible_loads == set()
+
+    def test_mp_cancel_during_inflight_load_no_early_report(self):
+        """MP variant: a pending load future is never reported early."""
+        worker = _make_mp_worker()
+
+        pending_future = _SpyFuture(value=True)  # not done
+        worker._inflight_loads = {8: (pending_future, _FakeEvent())}
+
+        saves, loads = worker.get_finished([], [8])
+        assert saves == []
+        assert loads == []
+        assert 8 in worker._inflight_loads
+
+        pending_future.mark_done()
+        _saves, loads = worker.get_finished([], [])
+        assert loads == [8]
+        assert worker._inflight_loads == {}
+        assert worker._eligible_loads == set()
+
+    # -- cancel before the request ever became a save ---------------------
+
+    def test_inproc_cancel_before_save_registered_is_noop(self):
+        """Cancel of a request never registered for saving is harmless.
+
+        If a request is cancelled during the async-load phase — before
+        build_connector_meta added it to ``_saving_in_flight`` — then
+        ``request_finished`` returns False (nothing to defer) and no
+        tracking entry is stranded.
+        """
+        sched = _make_inproc_scheduler()
+        worker = _make_inproc_worker()
+
+        req = _FakeLlmRequest(request_id=123)
+        assert sched.request_finished(req, []) is False
+        assert sched._saving_in_flight == set()
+
+        # And a get_finished naming it as finished-gen still resolves it
+        # (no in-flight save → immediate report), leaving nothing behind.
+        saves, loads = worker.get_finished([123], [])
+        assert saves == [123]
+        assert loads == []
+        assert worker._inflight_saves == {}
+        assert worker._eligible_saves == set()
+
+    def test_mp_cancel_before_save_registered_is_noop(self):
+        """MP variant: cancel of an unregistered request drains cleanly."""
+        sched = _make_mp_scheduler()
+        worker = _make_mp_worker()
+
+        assert sched.request_finished(_FakeLlmRequest(request_id=123), []) is False
+        assert sched._saving_in_flight == set()
+
+        saves, loads = worker.get_finished([123], [])
+        assert saves == [123]
+        assert loads == []
+        assert worker._inflight_saves == {}
+        assert worker._eligible_saves == set()
