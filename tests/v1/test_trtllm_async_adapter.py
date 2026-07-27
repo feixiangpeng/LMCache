@@ -55,11 +55,12 @@ _CHUNK_SIZE = 256
 
 @dataclass
 class _FakeLlmRequest:
-    """Minimal LlmRequest stand-in: the adapters only touch request_id
-    and get_tokens(0)."""
+    """Minimal LlmRequest stand-in: the adapters only touch request_id,
+    get_tokens(0), and cache_salt."""
 
     request_id: int = 0
     _tokens: List[int] = field(default_factory=list)
+    cache_salt: str = ""
 
     def get_tokens(self, beam: int) -> List[int]:
         return self._tokens
@@ -158,6 +159,7 @@ def _make_mp_scheduler() -> LMCacheMPKvConnectorScheduler:
     sched._chunk_size = _CHUNK_SIZE
     sched._pending = {}
     sched._saving_in_flight = set()
+    sched._pending_async_loads = {}
     sched._zmq_context = MagicMock()
     sched._mq_client = MagicMock()
     sched._rank = 0
@@ -186,6 +188,7 @@ def _make_inproc_scheduler() -> LMCacheKvConnectorScheduler:
     sched._pending = {}
     sched._engine = None
     sched._saving_in_flight = set()
+    sched._pending_async_loads = {}
     return sched
 
 
@@ -530,3 +533,242 @@ class TestInProcessAdapterAsyncStore:
 
         assert new_matched == 0
         assert is_async is False
+
+
+# ---------------------------------------------------------------------------
+# Cache salt isolation tests
+# ---------------------------------------------------------------------------
+
+
+class TestInProcessCacheSaltIsolation:
+    """Verify the in-process adapter threads cache_salt into engine calls."""
+
+    def test_lookup_passes_request_configs_with_salt(self):
+        """lookup must pass request_configs with lmcache.tag.cache_salt."""
+        sched = _make_inproc_scheduler()
+
+        mock_engine = MagicMock()
+        mock_engine.lookup.return_value = 512
+        sched._engine = mock_engine
+
+        req = _FakeLlmRequest(
+            request_id=1, _tokens=list(range(1024)), cache_salt="user-abc"
+        )
+        new_matched, is_async = sched.get_num_new_matched_tokens(req, 0)
+
+        assert new_matched == 512
+        assert is_async is True
+        mock_engine.lookup.assert_called_once()
+        call_kwargs = mock_engine.lookup.call_args[1]
+        assert call_kwargs["request_configs"] == {
+            "lmcache.tag.cache_salt": "user-abc"
+        }
+
+    def test_lookup_no_request_configs_when_salt_empty(self):
+        """When cache_salt is empty, request_configs should be None."""
+        sched = _make_inproc_scheduler()
+
+        mock_engine = MagicMock()
+        mock_engine.lookup.return_value = 256
+        sched._engine = mock_engine
+
+        req = _FakeLlmRequest(request_id=2, _tokens=list(range(1024)))
+        sched.get_num_new_matched_tokens(req, 0)
+
+        call_kwargs = mock_engine.lookup.call_args[1]
+        assert call_kwargs.get("request_configs") is None
+
+    def test_store_passes_request_configs_with_salt(self, monkeypatch):
+        """wait_for_save must pass cache_salt via request_configs."""
+        worker = _make_inproc_worker()
+        monkeypatch.setattr(inproc_mod, "torch_dev", _FAKE_TORCH_DEV)
+
+        worker._metadata = LMCacheConnectorMetadata(
+            saves={
+                10: inproc_mod._BlockSpec(
+                    tokens=list(range(256)),
+                    block_ids=[0, 1],
+                    cache_salt="tenant-x",
+                )
+            }
+        )
+        worker.wait_for_save(_FakeStream())
+
+        worker._engine.store.assert_called_once()
+        call_kwargs = worker._engine.store.call_args[1]
+        assert call_kwargs["request_configs"] == {
+            "lmcache.tag.cache_salt": "tenant-x"
+        }
+
+    def test_retrieve_passes_request_configs_with_salt(self, monkeypatch):
+        """start_load_kv must pass cache_salt via request_configs."""
+        worker = _make_inproc_worker()
+        monkeypatch.setattr(inproc_mod, "torch_dev", _FAKE_TORCH_DEV)
+
+        worker._metadata = LMCacheConnectorMetadata(
+            loads={
+                5: inproc_mod._BlockSpec(
+                    tokens=list(range(256)),
+                    block_ids=[0, 1],
+                    cache_salt="tenant-y",
+                )
+            }
+        )
+        worker.start_load_kv(_FakeStream())
+
+        worker._engine.retrieve.assert_called_once()
+        call_kwargs = worker._engine.retrieve.call_args[1]
+        assert call_kwargs["request_configs"] == {
+            "lmcache.tag.cache_salt": "tenant-y"
+        }
+
+    def test_salt_threaded_through_build_connector_meta(self):
+        """cache_salt captured in get_num_new_matched_tokens must appear in
+        the _BlockSpec emitted by build_connector_meta."""
+        sched = _make_inproc_scheduler()
+
+        mock_engine = MagicMock()
+        mock_engine.lookup.return_value = 512
+        sched._engine = mock_engine
+
+        req = _FakeLlmRequest(
+            request_id=7, _tokens=list(range(1024)), cache_salt="salt-42"
+        )
+        sched.get_num_new_matched_tokens(req, 0)
+
+        sched_req = MagicMock()
+        sched_req.request_id = 7
+        sched_req.new_block_ids = list(range(16))
+        sched_req.computed_position = 0
+        sched_req.new_tokens = list(range(1024))
+
+        sched_output = MagicMock()
+        sched_output.new_requests = [sched_req]
+
+        meta = sched.build_connector_meta(sched_output)
+        assert meta.loads[7].cache_salt == "salt-42"
+        assert meta.saves[7].cache_salt == "salt-42"
+
+
+class TestMPCacheSaltIsolation:
+    """Verify the MP adapter threads cache_salt into IPCCacheServerKey."""
+
+    def test_lookup_key_includes_cache_salt(self, monkeypatch):
+        """The LOOKUP key must carry the request's cache_salt."""
+        sched = _make_mp_scheduler()
+
+        sent_keys = []
+
+        def fake_send(mq_client, request_type, payloads):
+            if request_type == mp_mod.RequestType.LOOKUP:
+                sent_keys.append(payloads[0])
+            f = _SpyFuture()
+            f.set_result(2)
+            return f
+
+        monkeypatch.setattr(mp_mod, "_send_request", fake_send)
+
+        req = _FakeLlmRequest(
+            request_id=1, _tokens=list(range(1024)), cache_salt="user-abc"
+        )
+        sched.get_num_new_matched_tokens(req, 0)
+
+        assert len(sent_keys) == 1
+        assert sent_keys[0].cache_salt == "user-abc"
+
+    def test_store_key_includes_cache_salt(self, monkeypatch):
+        """The STORE key must carry cache_salt from the metadata spec."""
+        worker = _make_mp_worker()
+
+        sent_keys = []
+
+        def fake_send(mq_client, request_type, payloads):
+            if request_type == mp_mod.RequestType.STORE:
+                sent_keys.append(payloads[0])
+            f = _SpyFuture()
+            f.set_result(True)
+            return f
+
+        monkeypatch.setattr(mp_mod, "_send_request", fake_send)
+        monkeypatch.setattr(mp_mod, "check_interprocess_event_support", lambda: None)
+        monkeypatch.setattr(mp_mod, "torch_dev", _FAKE_TORCH_DEV)
+
+        worker._metadata = LMCacheMPConnectorMetadata(
+            saves={
+                42: _BlockSpec(
+                    tokens=list(range(256)),
+                    block_ids=[0, 1, 2, 3],
+                    cache_salt="tenant-z",
+                )
+            }
+        )
+        worker.wait_for_save(_FakeStream())
+
+        assert len(sent_keys) == 1
+        assert sent_keys[0].cache_salt == "tenant-z"
+
+    def test_retrieve_key_includes_cache_salt(self, monkeypatch):
+        """The RETRIEVE key must carry cache_salt from the metadata spec."""
+        worker = _make_mp_worker()
+
+        sent_keys = []
+
+        def fake_send(mq_client, request_type, payloads):
+            if request_type == mp_mod.RequestType.RETRIEVE:
+                sent_keys.append(payloads[0])
+            f = _SpyFuture()
+            f.set_result(True)
+            return f
+
+        monkeypatch.setattr(mp_mod, "_send_request", fake_send)
+        monkeypatch.setattr(mp_mod, "check_interprocess_event_support", lambda: None)
+        monkeypatch.setattr(mp_mod, "torch_dev", _FAKE_TORCH_DEV)
+
+        worker._metadata = LMCacheMPConnectorMetadata(
+            loads={
+                5: _BlockSpec(
+                    tokens=list(range(256)),
+                    block_ids=[0, 1],
+                    cache_salt="tenant-w",
+                )
+            }
+        )
+        worker.start_load_kv(_FakeStream())
+
+        assert len(sent_keys) == 1
+        assert sent_keys[0].cache_salt == "tenant-w"
+
+    def test_salt_threaded_through_build_connector_meta(self, monkeypatch):
+        """cache_salt from get_num_new_matched_tokens reaches the specs."""
+        sched = _make_mp_scheduler()
+
+        call_count = [0]
+
+        def fake_send(mq_client, request_type, payloads):
+            f = _SpyFuture()
+            call_count[0] += 1
+            if call_count[0] == 1:
+                f.set_result(None)
+            else:
+                f.set_result(2)
+            return f
+
+        monkeypatch.setattr(mp_mod, "_send_request", fake_send)
+
+        req = _FakeLlmRequest(
+            request_id=3, _tokens=list(range(1024)), cache_salt="my-salt"
+        )
+        sched.get_num_new_matched_tokens(req, 0)
+
+        sched_req = MagicMock()
+        sched_req.request_id = 3
+        sched_req.new_block_ids = list(range(16))
+        sched_req.computed_position = 0
+        sched_req.new_tokens = list(range(1024))
+
+        sched_output = MagicMock()
+        sched_output.new_requests = [sched_req]
+
+        meta = sched.build_connector_meta(sched_output)
+        assert meta.loads[3].cache_salt == "my-salt"
+        assert meta.saves[3].cache_salt == "my-salt"

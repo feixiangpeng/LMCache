@@ -131,6 +131,7 @@ class _BlockSpec:
 
     tokens: List[int]
     block_ids: List[int]
+    cache_salt: str = ""
 
 
 @dataclass
@@ -185,23 +186,24 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
             ``(new_matched, is_async)``.
         """
         t0 = time.perf_counter()
+        cache_salt = getattr(request, "cache_salt", None) or ""
 
         if not self._engine:
             self._engine = LMCacheEngineBuilder.get(ENGINE_NAME)
         if not self._engine:
-            self._pending[request.request_id] = ([], 0)
+            self._pending[request.request_id] = ([], 0, cache_salt)
             return 0, False
 
         # TRT-LLM should always pass block-aligned positions.
         if num_computed_tokens % self._block_size != 0:
-            self._pending[request.request_id] = ([], 0)
+            self._pending[request.request_id] = ([], 0, cache_salt)
             return 0, False
 
         all_tokens = list(request.get_tokens(0))
 
         max_block_aligned = (len(all_tokens) // self._block_size) * self._block_size
         if num_computed_tokens >= max_block_aligned:
-            self._pending[request.request_id] = (all_tokens, 0)
+            self._pending[request.request_id] = (all_tokens, 0, cache_salt)
             logger.debug(
                 "LMCache TRT-LLM scheduler: req %d short-circuit "
                 "(TRT matched %d of %d block-aligned tokens) %.3fms",
@@ -212,14 +214,17 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
             )
             return 0, False
 
+        request_configs = {"lmcache.tag.cache_salt": cache_salt} if cache_salt else None
         t1 = time.perf_counter()
-        cached_tokens = self._engine.lookup(tokens=all_tokens)
+        cached_tokens = self._engine.lookup(
+            tokens=all_tokens, request_configs=request_configs
+        )
         t2 = time.perf_counter()
 
         new_matched = max(0, cached_tokens - num_computed_tokens)
         new_matched = (new_matched // self._block_size) * self._block_size
 
-        self._pending[request.request_id] = (all_tokens, new_matched)
+        self._pending[request.request_id] = (all_tokens, new_matched, cache_salt)
 
         # Return is_async=True to park the request while loading.
         is_async = new_matched > 0
@@ -252,13 +257,14 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
             if req.request_id not in self._pending:
                 continue
 
-            all_tokens, num_matched = self._pending[req.request_id]
+            all_tokens, num_matched, cache_salt = self._pending[req.request_id]
             block_ids: List[int] = list(req.new_block_ids)
             num_computed_blocks = req.computed_position // self._block_size
 
             if num_matched > 0:
                 meta.loads[req.request_id] = _BlockSpec(
-                    tokens=all_tokens, block_ids=block_ids
+                    tokens=all_tokens, block_ids=block_ids,
+                    cache_salt=cache_salt,
                 )
 
             save_start = max(num_computed_blocks, num_matched // self._block_size)
@@ -270,7 +276,8 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
                 and save_start < num_computed_blocks + num_full_new_blocks
             ):
                 meta.saves[req.request_id] = _BlockSpec(
-                    tokens=all_tokens, block_ids=block_ids
+                    tokens=all_tokens, block_ids=block_ids,
+                    cache_salt=cache_salt,
                 )
                 self._saving_in_flight.add(req.request_id)
 
@@ -278,8 +285,11 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
         # scheduler_output but received block_ids via update_state_after_alloc.
         for req_id, block_ids in self._pending_async_loads.items():
             if req_id in self._pending:
-                all_tokens, _num_matched = self._pending[req_id]
-                meta.loads[req_id] = _BlockSpec(tokens=all_tokens, block_ids=block_ids)
+                all_tokens, _num_matched, cache_salt = self._pending[req_id]
+                meta.loads[req_id] = _BlockSpec(
+                    tokens=all_tokens, block_ids=block_ids,
+                    cache_salt=cache_salt,
+                )
 
         self._pending_async_loads.clear()
         self._pending.clear()
@@ -314,7 +324,7 @@ class LMCacheKvConnectorScheduler(KvCacheConnectorScheduler):
         ``build_connector_meta`` can inject them into metadata.loads.
         """
         if request.request_id in self._pending:
-            _tokens, num_matched = self._pending[request.request_id]
+            _tokens, num_matched, _cache_salt = self._pending[request.request_id]
             if num_matched > 0:
                 self._pending_async_loads[request.request_id] = list(block_ids)
 
@@ -380,7 +390,14 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
         for req_id, spec in meta.loads.items():
             if not spec.tokens or not spec.block_ids:
                 continue
-            self._engine.retrieve(tokens=spec.tokens, block_ids=spec.block_ids)
+            request_configs = (
+                {"lmcache.tag.cache_salt": spec.cache_salt}
+                if spec.cache_salt else None
+            )
+            self._engine.retrieve(
+                tokens=spec.tokens, block_ids=spec.block_ids,
+                request_configs=request_configs,
+            )
             # Record an event on the load stream after all retrieve ops
             # for this request have been enqueued.
             if self._load_stream is not None:
@@ -423,7 +440,14 @@ class LMCacheKvConnectorWorker(KvCacheConnectorWorker):
         for req_id, spec in meta.saves.items():
             if not spec.tokens or not spec.block_ids:
                 continue
-            self._engine.store(tokens=spec.tokens, block_ids=spec.block_ids)
+            request_configs = (
+                {"lmcache.tag.cache_salt": spec.cache_salt}
+                if spec.cache_salt else None
+            )
+            self._engine.store(
+                tokens=spec.tokens, block_ids=spec.block_ids,
+                request_configs=request_configs,
+            )
 
         # Record a single event after all stores for this batch — since
         # they're all on the same store stream, one event suffices to

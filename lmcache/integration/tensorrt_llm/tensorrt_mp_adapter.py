@@ -87,6 +87,7 @@ def _completed_future(result: bool) -> MessagingFuture:
 class _BlockSpec:
     tokens: List[int]
     block_ids: List[int]
+    cache_salt: str = ""
 
 
 @dataclass
@@ -145,6 +146,7 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
         start: int,
         end: int,
         request_id: int,
+        cache_salt: str = "",
     ) -> IPCCacheServerKey:
         return IPCCacheServerKey(
             model_name=self._model_name,
@@ -154,6 +156,7 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
             start=start,
             end=end,
             request_id=str(request_id),
+            cache_salt=cache_salt,
         )
 
     def get_num_new_matched_tokens(
@@ -178,20 +181,23 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
         """
         t0 = time.perf_counter()
 
+        cache_salt = getattr(request, "cache_salt", None) or ""
+
         if num_computed_tokens % self._block_size != 0:
-            self._pending[request.request_id] = ([], 0)
+            self._pending[request.request_id] = ([], 0, cache_salt)
             return 0, False
 
         all_tokens = list(request.get_tokens(0))
 
         max_block_aligned = (len(all_tokens) // self._block_size) * self._block_size
         if num_computed_tokens >= max_block_aligned:
-            self._pending[request.request_id] = (all_tokens, 0)
+            self._pending[request.request_id] = (all_tokens, 0, cache_salt)
             return 0, False
 
         aligned_end = (len(all_tokens) // self._chunk_size) * self._chunk_size
         key = self._create_key(
-            all_tokens, start=0, end=aligned_end, request_id=request.request_id
+            all_tokens, start=0, end=aligned_end,
+            request_id=request.request_id, cache_salt=cache_salt,
         ).no_worker_id_version()
 
         t1 = time.perf_counter()
@@ -208,7 +214,7 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
             cached_tokens = result * self._chunk_size if result is not None else 0
         except Exception as e:
             logger.warning("LMCache MP scheduler: lookup failed: %s", e)
-            self._pending[request.request_id] = (all_tokens, 0)
+            self._pending[request.request_id] = (all_tokens, 0, cache_salt)
             return 0, False
 
         t2 = time.perf_counter()
@@ -225,6 +231,7 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
                 start=0,
                 end=overlap_end,
                 request_id=request.request_id,
+                cache_salt=cache_salt,
             ).no_worker_id_version()
             try:
                 _send_request(
@@ -235,7 +242,7 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
             except Exception as e:
                 logger.warning("LMCache MP scheduler: free_lookup_locks failed: %s", e)
 
-        self._pending[request.request_id] = (all_tokens, new_matched)
+        self._pending[request.request_id] = (all_tokens, new_matched, cache_salt)
 
         # Return is_async=True when there are tokens to load. TRT-LLM will
         # park the request and rely on get_finished to report load completion.
@@ -270,13 +277,14 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
             if req.request_id not in self._pending:
                 continue
 
-            all_tokens, num_matched = self._pending[req.request_id]
+            all_tokens, num_matched, cache_salt = self._pending[req.request_id]
             block_ids: List[int] = list(req.new_block_ids)
             num_computed_blocks = req.computed_position // self._block_size
 
             if num_matched > 0:
                 meta.loads[req.request_id] = _BlockSpec(
-                    tokens=all_tokens, block_ids=block_ids
+                    tokens=all_tokens, block_ids=block_ids,
+                    cache_salt=cache_salt,
                 )
 
             save_start = max(num_computed_blocks, num_matched // self._block_size)
@@ -288,7 +296,8 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
                 and save_start < num_computed_blocks + num_full_new_blocks
             ):
                 meta.saves[req.request_id] = _BlockSpec(
-                    tokens=all_tokens, block_ids=block_ids
+                    tokens=all_tokens, block_ids=block_ids,
+                    cache_salt=cache_salt,
                 )
                 # Pre-register: the worker will fire STORE for this request
                 # in wait_for_save (same step). request_finished may be
@@ -300,8 +309,11 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
         # scheduler_output but received block_ids via update_state_after_alloc.
         for req_id, block_ids in self._pending_async_loads.items():
             if req_id in self._pending:
-                all_tokens, _num_matched = self._pending[req_id]
-                meta.loads[req_id] = _BlockSpec(tokens=all_tokens, block_ids=block_ids)
+                all_tokens, _num_matched, cache_salt = self._pending[req_id]
+                meta.loads[req_id] = _BlockSpec(
+                    tokens=all_tokens, block_ids=block_ids,
+                    cache_salt=cache_salt,
+                )
 
         self._pending_async_loads.clear()
         self._pending.clear()
@@ -335,7 +347,7 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
         ``build_connector_meta`` can inject them into metadata.loads.
         """
         if request.request_id in self._pending:
-            _tokens, num_matched = self._pending[request.request_id]
+            _tokens, num_matched, _cache_salt = self._pending[request.request_id]
             if num_matched > 0:
                 self._pending_async_loads[request.request_id] = list(block_ids)
 
@@ -388,6 +400,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
         self,
         token_ids: List[int],
         request_id: int,
+        cache_salt: str = "",
     ) -> IPCCacheServerKey:
         aligned_end = (len(token_ids) // self._chunk_size) * self._chunk_size
         return IPCCacheServerKey(
@@ -398,6 +411,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
             start=0,
             end=aligned_end,
             request_id=str(request_id),
+            cache_salt=cache_salt,
         )
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor) -> None:
@@ -493,7 +507,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 )
                 continue
 
-            key = self._create_key(spec.tokens, req_id)
+            key = self._create_key(spec.tokens, req_id, cache_salt=spec.cache_salt)
             try:
                 future = _send_request(
                     self._mq_client,
@@ -557,7 +571,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 )
                 continue
 
-            key = self._create_key(spec.tokens, req_id)
+            key = self._create_key(spec.tokens, req_id, cache_salt=spec.cache_salt)
             try:
                 future = _send_request(
                     self._mq_client,
